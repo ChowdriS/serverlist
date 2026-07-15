@@ -2,13 +2,18 @@
 Builds a serverlist output file (same shape as ExampleSL.xlsx) by combining:
   - a user-uploaded per-wave input file (serverlist/inputFile/{wave_name}.xlsx)
   - rightSizing.xlsx  (sheet "in")               -> OS family/version lookup
-  - phoenixtracker.xlsx (sheet "ServerTracker(working)") -> FQDN/region/tags/UEFI lookup
+  - phoenixtracker.xlsx (sheet "ServerTracker(working)") -> FQDN/region/domain/facing/tags/UEFI lookup
+  - subnet.xlsx (sheet "Sheet1")                 -> subnet_IDs lookup, keyed on
+    (environment, region, domain, facing) from phoenixtracker
+  - sg_mapping.csv                               -> securitygroup_IDs lookup, keyed on
+    (environment, region, domain, facing, tier) from phoenixtracker + the input file's app_tier
 
 Run:
     python generate_serverlist.py
 It will prompt for wave_name and environment (dev/stage/prod).
 """
 
+import collections
 import os
 import re
 import sys
@@ -19,7 +24,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 INPUT_DIR = os.path.join(BASE_DIR, "inputFile")
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 RIGHTSIZING_FILE = os.path.join(BASE_DIR, "rightSizing.xlsx")
-PHOENIXTRACKER_FILE = os.path.join(BASE_DIR, "phoenixtracker.xlsx")
+PHOENIXTRACKER_FILE = os.path.join(BASE_DIR, "tracker.xlsx")
+SUBNET_FILE = os.path.join(BASE_DIR, "subnet.xlsx")
+SG_FILE = os.path.join(BASE_DIR, "sg_mapping.csv")
 
 RIGHTSIZING_SHEET = "in"
 PHOENIXTRACKER_SHEET = "ServerTracker(working)"
@@ -29,6 +36,40 @@ ACCOUNT_ID_MAP = {
     "dev": "447648296582",
     "stage": "726725834586",
     "prod": "355564824768",
+}
+
+# subnet.xlsx's "env" column uses QA/DEV/Prod, not our dev/stage/prod input - this maps
+# between the two. "stage" -> "QA" is a best guess (no third env name matched) - correct
+# if subnet.xlsx's env taxonomy turns out to mean something else.
+ENV_TO_SUBNET_ENV = {
+    "dev": "DEV",
+    "stage": "QA",
+    "prod": "PROD",
+}
+
+# Hardcoded per-(environment, region) test subnet/SG, from the aws_lookup.py run
+# across dev/stage/prod x eu-central-1/eu-west-2/us-east-1.
+TEST_SUBNET_MAP = {
+    ("dev", "eu-central-1"): "subnet-077c6c459d5278082",
+    ("dev", "eu-west-2"): "subnet-0eddd1e9363b119f8",
+    ("dev", "us-east-1"): "subnet-0eda0c24afa95b976",
+    ("stage", "eu-central-1"): "subnet-0119bbd31d4f8ba98",
+    ("stage", "eu-west-2"): "subnet-091da59e75b333952",
+    ("stage", "us-east-1"): "subnet-0cc5c3e3a43596e5c",
+    ("prod", "eu-central-1"): "subnet-07f050523062e9102",
+    ("prod", "eu-west-2"): "subnet-076e1004e56eb10e0",
+    ("prod", "us-east-1"): "subnet-04a7797ffda4e08d0",
+}
+TEST_SG_MAP = {
+    ("dev", "eu-central-1"): "sg-0b7135bad9588e836",
+    ("dev", "eu-west-2"): "sg-094dc13866b9884e3",
+    ("dev", "us-east-1"): "sg-0127714ef3e32e742",
+    ("stage", "eu-central-1"): "sg-01ae6893030c17f76",
+    ("stage", "eu-west-2"): "sg-0735e412fac63c3e9",
+    ("stage", "us-east-1"): "sg-0944e1a65155a5421",
+    ("prod", "eu-central-1"): "sg-07f7b27a3c8ecba22",
+    ("prod", "eu-west-2"): "sg-08e5e73534517ca21",
+    ("prod", "us-east-1"): "sg-060772fff174b3777",
 }
 
 OUTPUT_COLUMNS = [
@@ -42,8 +83,7 @@ OUTPUT_COLUMNS = [
 
 # Columns whose real logic hasn't been defined yet - left blank for now.
 PENDING_COLUMNS = [
-    "subnet_IDs", "securitygroup_IDs", "subnet_IDs_test",
-    "securitygroup_IDs_test", "instanceType", "private_ip", "ebs_kms_key_id",
+    "instanceType", "private_ip", "ebs_kms_key_id",
 ]
 
 
@@ -54,9 +94,35 @@ def _norm(value) -> str:
     return str(value).strip().upper()
 
 
+def _norm_facing(value) -> str:
+    """Normalizes 'internal_facing'/'internal'/'external_facing'/'external' -> 'INTERNAL'/'EXTERNAL'."""
+    text = _norm(value)
+    if "INTERNAL" in text:
+        return "INTERNAL"
+    if "EXTERNAL" in text:
+        return "EXTERNAL"
+    return text
+
+
+def _resolve_sheet_name(path: str, expected_name: str) -> str:
+    """Finds the sheet matching expected_name ignoring spacing/case differences -
+    real source files sometimes have 'ServerTracker (working)' vs 'ServerTracker(working)'."""
+    def norm(s: str) -> str:
+        return re.sub(r"\s+", "", s).lower()
+
+    target = norm(expected_name)
+    sheet_names = pd.ExcelFile(path).sheet_names
+    for name in sheet_names:
+        if norm(name) == target:
+            return name
+    print(f"ERROR: no sheet resembling {expected_name!r} found in {path}. Available sheets: {sheet_names}")
+    sys.exit(1)
+
+
 def load_rightsizing_lookup() -> dict:
     """Maps normalized hostname -> {os_family, os_version} from rightSizing.xlsx."""
-    df = pd.read_excel(RIGHTSIZING_FILE, sheet_name=RIGHTSIZING_SHEET)
+    sheet_name = _resolve_sheet_name(RIGHTSIZING_FILE, RIGHTSIZING_SHEET)
+    df = pd.read_excel(RIGHTSIZING_FILE, sheet_name=sheet_name)
     lookup = {}
     for _, row in df.iterrows():
         key = _norm(row.get("Name"))
@@ -70,11 +136,13 @@ def load_rightsizing_lookup() -> dict:
 
 
 def load_phoenixtracker_lookup() -> dict:
-    """Maps normalized hostname -> {fqdn, region, tags, uefi} from phoenixtracker.xlsx.
+    """Maps normalized hostname -> {fqdn, region, domain, facing, tags, uefi, app_id}
+    from phoenixtracker.xlsx. domain/facing feed the subnet.xlsx lookup below.
 
     Row 1 of this sheet is a title row, so the real header is row 2 (header=1).
     """
-    df = pd.read_excel(PHOENIXTRACKER_FILE, sheet_name=PHOENIXTRACKER_SHEET, header=1)
+    sheet_name = _resolve_sheet_name(PHOENIXTRACKER_FILE, PHOENIXTRACKER_SHEET)
+    df = pd.read_excel(PHOENIXTRACKER_FILE, sheet_name=sheet_name, header=1)
     lookup = {}
     for _, row in df.iterrows():
         key = _norm(row.get("f"))
@@ -83,11 +151,101 @@ def load_phoenixtracker_lookup() -> dict:
         lookup[key] = {
             "fqdn": row.get("FQDN"),
             "region": row.get("Region"),
+            "domain": row.get("Domain"),
+            "facing": row.get("Internal/External"),
             "tags": row.get("Tags"),
             "uefi_enabled": row.get("UEFI Enabled"),
             "app_id": row.get("App ID"),
         }
     return lookup
+
+
+def load_subnet_lookup() -> dict:
+    """Maps (env, region, domain, facing) -> list of subnet IDs from subnet.xlsx.
+    Multiple subnet IDs can share one combo (comma-separated in the "subnets" column)."""
+    df = pd.read_excel(SUBNET_FILE)
+    lookup = {}
+    for _, row in df.iterrows():
+        key = (
+            _norm(row.get("env")),
+            _norm(row.get("region")),
+            _norm(row.get("domain")),
+            _norm_facing(row.get("facing")),
+        )
+        subnets_raw = row.get("subnets")
+        if subnets_raw is None or (isinstance(subnets_raw, float) and pd.isna(subnets_raw)):
+            continue
+        lookup[key] = [s.strip() for s in str(subnets_raw).split(",") if s.strip()]
+    return lookup
+
+
+def resolve_subnet_id(environment: str, px: dict, subnet_lookup: dict,
+                       subnet_usage_counter: dict, server_name) -> object:
+    """Picks a subnet ID for subnet_IDs, matched on (environment, region, domain, facing)
+    from the caller's phoenixtracker row. When a combo has multiple candidate subnets,
+    cycles through them round-robin (via subnet_usage_counter) so servers sharing the
+    same combo get spread evenly across those subnets instead of all landing on the
+    first one. Does not touch subnet_IDs_test."""
+    subnet_env = ENV_TO_SUBNET_ENV.get(environment)
+    key = (
+        _norm(subnet_env),
+        _norm(px.get("region")),
+        _norm(px.get("domain")),
+        _norm_facing(px.get("facing")),
+    )
+    candidates = subnet_lookup.get(key)
+    if not candidates:
+        print(f"WARNING: {server_name!r} - no subnet.xlsx match for env={subnet_env!r} "
+              f"region={px.get('region')!r} domain={px.get('domain')!r} facing={px.get('facing')!r}")
+        return None
+    index = subnet_usage_counter[key] % len(candidates)
+    subnet_usage_counter[key] += 1
+    return candidates[index]
+
+
+def resolve_test_value(test_map: dict, environment: str, px: dict, server_name, field_label: str) -> object:
+    """Looks up TEST_SUBNET_MAP/TEST_SG_MAP by (environment, region), region taken
+    from the caller's phoenixtracker row. Warns instead of guessing if unmatched."""
+    region = px.get("region")
+    region_key = str(region).strip().lower() if region and not (isinstance(region, float) and pd.isna(region)) else ""
+    value = test_map.get((environment, region_key))
+    if value is None:
+        print(f"WARNING: {server_name!r} - no {field_label} for env={environment!r} region={region!r}")
+    return value
+
+
+def load_sg_lookup() -> dict:
+    """Maps (env, region, domain, facing, tier) -> security_group_ids string from sg_mapping.csv."""
+    df = pd.read_csv(SG_FILE)
+    lookup = {}
+    for _, row in df.iterrows():
+        key = (
+            str(row.get("env")).strip().lower(),
+            _norm(row.get("region")),
+            _norm(row.get("domain")),
+            _norm_facing(row.get("facing")),
+            str(row.get("tier")).strip().lower(),
+        )
+        lookup[key] = row.get("security_group_ids")
+    return lookup
+
+
+def resolve_security_group_ids(environment: str, px: dict, tier, sg_lookup: dict, server_name) -> object:
+    """Looks up securitygroup_IDs from sg_mapping.csv, matched on
+    (environment, region, domain, facing, tier) - tier is the row's app/db server_tier."""
+    tier_key = str(tier).strip().lower() if tier else ""
+    key = (
+        str(environment).strip().lower(),
+        _norm(px.get("region")),
+        _norm(px.get("domain")),
+        _norm_facing(px.get("facing")),
+        tier_key,
+    )
+    value = sg_lookup.get(key)
+    if value is None:
+        print(f"WARNING: {server_name!r} - no sg_mapping.csv match for env={environment!r} "
+              f"region={px.get('region')!r} domain={px.get('domain')!r} facing={px.get('facing')!r} tier={tier!r}")
+    return value
 
 
 def dedupe_by_phoenix_app_id(input_df: pd.DataFrame, phoenix_lookup: dict) -> pd.DataFrame:
@@ -171,6 +329,9 @@ def build_serverlist(wave_name: str, environment: str) -> pd.DataFrame:
     input_df = load_input_file(wave_name)
     rightsizing_lookup = load_rightsizing_lookup()
     phoenix_lookup = load_phoenixtracker_lookup()
+    subnet_lookup = load_subnet_lookup()
+    subnet_usage_counter = collections.defaultdict(int)
+    sg_lookup = load_sg_lookup()
     input_df = dedupe_by_phoenix_app_id(input_df, phoenix_lookup)
     account_id = ACCOUNT_ID_MAP[environment]
 
@@ -199,10 +360,10 @@ def build_serverlist(wave_name: str, environment: str) -> pd.DataFrame:
             "server_tier": in_row.get("app_tier"),
             "server_environment": environment,
             "r_type": "Rehost",
-            "subnet_IDs": None,
-            "securitygroup_IDs": None,
-            "subnet_IDs_test": None,
-            "securitygroup_IDs_test": None,
+            "subnet_IDs": resolve_subnet_id(environment, px, subnet_lookup, subnet_usage_counter, server_name),
+            "securitygroup_IDs": resolve_security_group_ids(environment, px, in_row.get("app_tier"), sg_lookup, server_name),
+            "subnet_IDs_test": resolve_test_value(TEST_SUBNET_MAP, environment, px, server_name, "subnet_IDs_test"),
+            "securitygroup_IDs_test": resolve_test_value(TEST_SG_MAP, environment, px, server_name, "securitygroup_IDs_test"),
             "instanceType": None,
             "tenancy": "Shared",
             "tags": sanitize(px.get("tags")),
