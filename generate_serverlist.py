@@ -288,16 +288,10 @@ def dedupe_by_phoenix_app_id(input_df: pd.DataFrame, phoenix_lookup: dict) -> pd
     return pd.DataFrame(keep_rows, columns=input_df.columns).reset_index(drop=True)
 
 
-def resolve_uefi_flag(raw_value) -> object:
-    """'efi'-ish values -> True, 'bios'-ish values -> False, unknown/missing -> None."""
-    if raw_value is None or (isinstance(raw_value, float) and pd.isna(raw_value)):
-        return None
+def resolve_uefi_flag(raw_value) -> bool:
+    """Only two values ever appear in this column: 'efi' -> True, 'bios' -> False."""
     text = str(raw_value).strip().lower()
-    if "efi" in text:
-        return True
-    if "bios" in text:
-        return False
-    return None
+    return text == "efi"
 
 
 _SANITIZE_RE = re.compile(r"\s*[|-]\s*")
