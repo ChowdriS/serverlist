@@ -1,0 +1,29 @@
+Missing Security Groups by Region/Account/Domain/Tier
+======================================================
+(Based on sg_mapping.csv - AWS console searches turned up no matching SG
+for these combos; app tier should have 2 SGs, db tier should have 3.)
+
+PROD (355564824768)
+--------------------
+eu-west-2  | internal | aonnet.aon.net  | db  -> missing DB-BKUP (only AON-DB + VMIBASE found)
+eu-west-2  | external | aonnet.aon.net  | db  -> missing DB-BKUP (only AON-DB + VMIBASE found)
+eu-west-2  | external | extad.aon.net   | db  -> missing DB-BKUP (only AON-DB + VMIBASE found)
+us-east-1  | external | aonnet.aon.net  | db  -> missing DB-BKUP (only AON-DB + VMIBASE found)
+us-east-1  | external | extad.aon.net   | app -> missing VMIBASE (only AON-APP found)
+us-east-1  | external | extad.aon.net   | db  -> missing VMIBASE (only AON-DB + DB-BKUP found)
+
+STAGE (726725834586)
+---------------------
+eu-west-2  | external | aonnet.aon.net  | db  -> missing DB-BKUP (only AON-DB + VMIBASE found)
+us-east-1  | external | aonnet.aon.net  | db  -> missing DB-BKUP (only AON-DB + VMIBASE found)
+
+DEV (447648296582)
+-------------------
+No missing SGs within what exists - but note: dev has NO external-facing
+security groups at all, in any region (eu-central-1, eu-west-2, us-east-1).
+Only internal-facing SGs exist for dev. This is a structural gap, not a
+single missing SG - confirm whether dev is expected to have external SGs
+at all before assuming this needs fixing.
+
+Everything else (all internal-facing combos in prod/stage, and all
+eu-central-1 external combos in prod/stage) has the full expected SG set.
